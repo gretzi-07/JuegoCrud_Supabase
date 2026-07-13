@@ -1,1 +1,578 @@
+(function(){
+  "use strict";
 
+  /* =====================================================================
+     CONFIGURÁ TU PROYECTO SUPABASE ACÁ ABAJO (las dos líneas siguientes).
+     La anon key es pública por diseño: la seguridad la dan las políticas
+     RLS de la base, no mantenerla en secreto. Una vez completadas estas
+     dos líneas, el juego funciona igual en cualquier dispositivo sin
+     pedir ninguna configuración.
+  ===================================================================== */
+  var SUPABASE_URL = "https://wbvjexlsnnnsaitonsyu.supabase.co";
+  var SUPABASE_ANON_KEY = "sb_publishable_gmvCNBOb5SwWauDj0MUpDw_6IlijB8b";
+  /* ===================================================================== */
+
+  var LETTERS = ['B','I','N','G','O'];
+  var RANGES = [[1,15],[16,30],[31,45],[46,60],[61,75]];
+
+  var sb = null;
+  var channel = null;
+  var session = { role:null, code:null, playerId:null, playerName:null };
+  var currentState = null;
+  var toastTimer = null;
+
+  /* ---------------- Utilities ---------------- */
+
+  function letterFor(n){
+    if(n<=15) return 'B';
+    if(n<=30) return 'I';
+    if(n<=45) return 'N';
+    if(n<=60) return 'G';
+    return 'O';
+  }
+
+  function randomCode(){
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    var out = '';
+    for(var i=0;i<5;i++){ out += chars[Math.floor(Math.random()*chars.length)]; }
+    return out;
+  }
+
+  function showToast(msg, type){
+    var el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = 'show' + (type ? ' '+type : '');
+    if(toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ el.className = ''; }, 3200);
+  }
+
+  function generateCard(){
+    var cols = [];
+    for(var c=0;c<5;c++){
+      var min = RANGES[c][0], max = RANGES[c][1];
+      var nums = [];
+      while(nums.length < 5){
+        var n = Math.floor(Math.random()*(max-min+1)) + min;
+        if(nums.indexOf(n) === -1) nums.push(n);
+      }
+      cols.push(nums);
+    }
+    var grid = [];
+    for(var r=0;r<5;r++){
+      var row = [];
+      for(var c2=0;c2<5;c2++){ row.push(cols[c2][r]); }
+      grid.push(row);
+    }
+    grid[2][2] = 'FREE';
+    return grid;
+  }
+
+  function initMarked(){
+    var m = [];
+    for(var r=0;r<5;r++){
+      var row = [];
+      for(var c=0;c<5;c++){ row.push(r===2 && c===2); }
+      m.push(row);
+    }
+    return m;
+  }
+
+  function checkPattern(marked){
+    var r, c, i;
+    for(r=0;r<5;r++){
+      var rowFull = true;
+      for(c=0;c<5;c++){ if(!marked[r][c]) rowFull = false; }
+      if(rowFull) return 'Fila ' + (r+1);
+    }
+    for(c=0;c<5;c++){
+      var colFull = true;
+      for(r=0;r<5;r++){ if(!marked[r][c]) colFull = false; }
+      if(colFull) return 'Columna ' + LETTERS[c];
+    }
+    var d1 = true, d2 = true;
+    for(i=0;i<5;i++){
+      if(!marked[i][i]) d1 = false;
+      if(!marked[i][4-i]) d2 = false;
+    }
+    if(d1) return 'Diagonal';
+    if(d2) return 'Diagonal';
+    var full = true;
+    for(r=0;r<5;r++){ for(c=0;c<5;c++){ if(!marked[r][c]) full = false; } }
+    if(full) return 'Cartón lleno';
+    return null;
+  }
+
+  function escapeHtml(str){
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  function setConnStatus(ok, text){
+    var el = document.getElementById('connStatus');
+    el.classList.toggle('off', !ok);
+    document.getElementById('connStatusText').textContent = text;
+  }
+
+  /* ---------------- Supabase data layer ---------------- */
+
+  function buildStateFromRows(gameRow, playersRows){
+    var players = {};
+    playersRows.forEach(function(row){
+      players[row.id] = { name: row.name, card: row.card, marked: row.marked };
+    });
+    return {
+      code: gameRow.id,
+      status: gameRow.status,
+      calledNumbers: gameRow.called_numbers || [],
+      currentNumber: gameRow.current_number,
+      winner: gameRow.winner_id ? { id: gameRow.winner_id, name: gameRow.winner_name, pattern: gameRow.winner_pattern } : null,
+      players: players
+    };
+  }
+
+  function loadFullState(code){
+    return sb.from('games').select('*').eq('id', code).maybeSingle().then(function(res){
+      if(res.error || !res.data) return null;
+      var gameRow = res.data;
+      return sb.from('players').select('*').eq('game_id', code).then(function(res2){
+        var playersRows = res2.data || [];
+        return buildStateFromRows(gameRow, playersRows);
+      });
+    });
+  }
+
+  function subscribeRealtime(code){
+    if(channel){ sb.removeChannel(channel); channel = null; }
+    channel = sb.channel('room-' + code)
+      .on('postgres_changes', { event:'*', schema:'public', table:'games', filter:'id=eq.' + code }, handleGameEvent)
+      .on('postgres_changes', { event:'*', schema:'public', table:'players', filter:'game_id=eq.' + code }, handlePlayerEvent)
+      .subscribe(function(status){
+        setConnStatus(status === 'SUBSCRIBED', status === 'SUBSCRIBED' ? 'En vivo' : 'Conectando...');
+      });
+  }
+
+  function unsubscribeRealtime(){
+    if(channel){ sb.removeChannel(channel); channel = null; }
+  }
+
+  function handleGameEvent(payload){
+    if(!currentState) return;
+    if(payload.eventType === 'DELETE'){
+      showToast('La partida fue eliminada.', 'err');
+      goLanding();
+      return;
+    }
+    var row = payload.new;
+    if(!row || row.id !== currentState.code) return;
+    currentState.status = row.status;
+    currentState.calledNumbers = row.called_numbers || [];
+    currentState.currentNumber = row.current_number;
+    currentState.winner = row.winner_id ? { id: row.winner_id, name: row.winner_name, pattern: row.winner_pattern } : null;
+    render();
+  }
+
+  function handlePlayerEvent(payload){
+    if(!currentState) return;
+    if(payload.eventType === 'DELETE'){
+      var oldRow = payload.old;
+      if(oldRow && currentState.players[oldRow.id]) delete currentState.players[oldRow.id];
+      render();
+      return;
+    }
+    var row = payload.new;
+    if(!row) return;
+    currentState.players[row.id] = { name: row.name, card: row.card, marked: row.marked };
+    render();
+  }
+
+  /* ---------------- Game actions ---------------- */
+
+  function createGameRow(){
+    var code = randomCode();
+    return sb.from('games').insert({ id: code, status:'waiting', called_numbers: [], current_number: null }).then(function(res){
+      if(res.error){ showToast('No se pudo crear la partida: ' + res.error.message, 'err'); return null; }
+      return code;
+    });
+  }
+
+  function joinPlayerFlow(code, name){
+    return sb.from('games').select('*').eq('id', code).maybeSingle().then(function(res){
+      if(res.error || !res.data) return { error: 'No existe ninguna partida con ese código.' };
+      if(res.data.status === 'ended') return { error: 'Esa partida ya finalizó.' };
+      var card = generateCard();
+      var marked = initMarked();
+      return sb.from('players').insert({ game_id: code, name: name, card: card, marked: marked }).select().single().then(function(res2){
+        if(res2.error) return { error: 'No se pudo unir a la partida: ' + res2.error.message };
+        return { id: res2.data.id };
+      });
+    });
+  }
+
+  function startGame(){
+    return sb.from('games').update({ status:'playing' }).eq('id', session.code).then(function(res){
+      if(res.error){ showToast('Error al iniciar: ' + res.error.message, 'err'); return; }
+      currentState.status = 'playing';
+      render();
+    });
+  }
+
+  function drawNumber(){
+    var state = currentState;
+    var all = [];
+    for(var i=1;i<=75;i++){ all.push(i); }
+    var remaining = all.filter(function(n){ return state.calledNumbers.indexOf(n) === -1; });
+    if(remaining.length === 0){
+      showToast('¡Ya salieron los 75 números!', 'err');
+      return Promise.resolve();
+    }
+    var n = remaining[Math.floor(Math.random()*remaining.length)];
+    var newCalled = state.calledNumbers.concat([n]);
+    return sb.from('games').update({ called_numbers: newCalled, current_number: n }).eq('id', session.code).then(function(res){
+      if(res.error){ showToast('Error al sacar número: ' + res.error.message, 'err'); return; }
+      state.calledNumbers = newCalled;
+      state.currentNumber = n;
+      render();
+    });
+  }
+
+  function endGame(){
+    return sb.from('games').update({ status:'ended' }).eq('id', session.code).then(function(res){
+      if(res.error){ showToast('Error al finalizar: ' + res.error.message, 'err'); return; }
+      currentState.status = 'ended';
+      render();
+    });
+  }
+
+  function toggleMark(r, c){
+    var state = currentState;
+    var player = state.players[session.playerId];
+    if(!player) return Promise.resolve();
+    if(r===2 && c===2) return Promise.resolve();
+    var num = player.card[r][c];
+    if(state.calledNumbers.indexOf(num) === -1){
+      showToast('Ese número todavía no salió.', 'err');
+      return Promise.resolve();
+    }
+    var newMarked = player.marked.map(function(row){ return row.slice(); });
+    newMarked[r][c] = !newMarked[r][c];
+    return sb.from('players').update({ marked: newMarked }).eq('id', session.playerId).then(function(res){
+      if(res.error){ showToast('Error al marcar: ' + res.error.message, 'err'); return; }
+      player.marked = newMarked;
+      render();
+    });
+  }
+
+  function claimBingo(){
+    var state = currentState;
+    var player = state.players[session.playerId];
+    if(!player) return Promise.resolve();
+    var pattern = checkPattern(player.marked);
+    if(!pattern){
+      showToast('Todavía no completaste un patrón válido.', 'err');
+      return Promise.resolve();
+    }
+    return sb.from('games')
+      .update({ status:'ended', winner_id: session.playerId, winner_name: player.name, winner_pattern: pattern })
+      .eq('id', session.code)
+      .is('winner_id', null)
+      .select()
+      .then(function(res){
+        if(res.error){ showToast('Error al cantar Bingo: ' + res.error.message, 'err'); return; }
+        if(!res.data || res.data.length === 0){
+          showToast('Otro jugador ya cantó Bingo primero.', 'err');
+          return;
+        }
+        state.status = 'ended';
+        state.winner = { id: session.playerId, name: player.name, pattern: pattern };
+        render();
+      });
+  }
+
+  /* ---------------- Screen switching ---------------- */
+
+  function showScreen(id){
+    ['screen-landing','screen-admin','screen-wait','screen-play'].forEach(function(s){
+      document.getElementById(s).classList.toggle('hidden', s !== id);
+    });
+  }
+
+  function goLanding(){
+    unsubscribeRealtime();
+    session = { role:null, code:null, playerId:null, playerName:null };
+    currentState = null;
+    if(sb) setConnStatus(true, 'Conectado');
+    showScreen('screen-landing');
+  }
+
+  /* ---------------- Rendering ---------------- */
+
+  function render(){
+    if(!currentState || !session.code){ return; }
+    var state = currentState;
+
+    if(session.role === 'admin'){
+      renderAdmin(state);
+    } else if(session.role === 'player'){
+      if(state.status === 'waiting'){
+        showScreen('screen-wait');
+        renderWait(state);
+      } else {
+        showScreen('screen-play');
+        renderPlay(state);
+      }
+    }
+
+    renderWinnerOverlay(state);
+  }
+
+  function statusLabel(status){
+    if(status === 'waiting') return 'Esperando';
+    if(status === 'playing') return 'En juego';
+    return 'Finalizada';
+  }
+
+  function renderAdmin(state){
+    showScreen('screen-admin');
+    document.getElementById('adminCodeChip').textContent = state.code;
+
+    var badge = document.getElementById('adminStatusBadge');
+    badge.textContent = statusLabel(state.status);
+    badge.className = 'status-badge status-' + state.status;
+
+    document.getElementById('adminEndedBanner').classList.toggle('hidden', state.status !== 'ended');
+
+    var ids = Object.keys(state.players);
+    document.getElementById('playerCount').textContent = '(' + ids.length + ')';
+    var listEl = document.getElementById('adminPlayerList');
+    if(ids.length === 0){
+      listEl.innerHTML = '<p class="empty-note">Nadie se unió todavía.</p>';
+    } else {
+      listEl.innerHTML = ids.map(function(id){
+        var p = state.players[id];
+        var markedCount = 0;
+        p.marked.forEach(function(row){ row.forEach(function(v){ if(v) markedCount++; }); });
+        return '<div class="player-item"><span><span class="dot"></span>' + escapeHtml(p.name) + '</span>' +
+          '<span class="mono" style="color:var(--gold-light);">' + markedCount + '/25</span></div>';
+      }).join('');
+    }
+
+    document.getElementById('btnStartGame').disabled = state.status !== 'waiting' || ids.length === 0;
+    document.getElementById('btnDrawNumber').disabled = state.status !== 'playing';
+    document.getElementById('btnEndGame').disabled = state.status === 'ended';
+
+    renderCaller(document.getElementById('callerBoxAdmin'), state);
+    renderHistory(document.getElementById('historyStripAdmin'), state);
+    renderMasterBoard(state);
+  }
+
+  function renderCaller(container, state){
+    if(state.currentNumber === null || state.currentNumber === undefined){
+      container.innerHTML = '<div class="label">Número actual</div><p class="empty-note">Todavía no salió ningún número.</p>';
+      return;
+    }
+    var n = state.currentNumber;
+    container.innerHTML =
+      '<div class="caller-ball">' + letterFor(n) + '-' + n + '</div>' +
+      '<div class="label">Bola número ' + state.calledNumbers.length + ' de 75</div>';
+  }
+
+  function renderHistory(container, state){
+    var nums = state.calledNumbers.slice().reverse().slice(0, 12);
+    if(nums.length === 0){ container.innerHTML = ''; return; }
+    container.innerHTML = nums.map(function(n, idx){
+      return '<span class="chip' + (idx===0 ? ' latest' : '') + '">' + letterFor(n) + '-' + n + '</span>';
+    }).join('');
+  }
+
+  function renderMasterBoard(state){
+    var board = document.getElementById('masterBoard');
+    var html = '';
+    LETTERS.forEach(function(l){ html += '<div class="letter-head">' + l + '</div>'; });
+    for(var row=0; row<15; row++){
+      for(var col=0; col<5; col++){
+        var n = RANGES[col][0] + row;
+        var called = state.calledNumbers.indexOf(n) !== -1;
+        html += '<div class="num' + (called ? ' called' : '') + '">' + n + '</div>';
+      }
+    }
+    board.innerHTML = html;
+  }
+
+  function renderWait(state){
+    document.getElementById('waitCodeChip').textContent = state.code;
+    document.getElementById('waitPlayerName').textContent = session.playerName;
+    var ids = Object.keys(state.players);
+    var listEl = document.getElementById('waitPlayerList');
+    listEl.innerHTML = ids.map(function(id){
+      var p = state.players[id];
+      return '<div class="player-item"><span><span class="dot"></span>' + escapeHtml(p.name) + '</span></div>';
+    }).join('');
+  }
+
+  function renderPlay(state){
+    document.getElementById('playCodeChip').textContent = state.code;
+    document.getElementById('playPlayerName').textContent = session.playerName;
+
+    var badge = document.getElementById('playStatusBadge');
+    badge.textContent = statusLabel(state.status);
+    badge.className = 'status-badge status-' + state.status;
+
+    document.getElementById('playEndedBanner').classList.toggle('hidden', state.status !== 'ended');
+    document.getElementById('btnClaimBingo').disabled = state.status !== 'playing';
+
+    renderCaller(document.getElementById('callerBoxPlayer'), state);
+    renderHistory(document.getElementById('historyStripPlayer'), state);
+
+    var player = state.players[session.playerId];
+    if(!player) return;
+    var grid = document.getElementById('bingoCardGrid');
+    var html = '';
+    for(var r=0;r<5;r++){
+      for(var c=0;c<5;c++){
+        var val = player.card[r][c];
+        var isFree = (r===2 && c===2);
+        var isMarked = player.marked[r][c];
+        var cls = 'bingo-cell' + (isFree ? ' free' : '') + (isMarked && !isFree ? ' marked' : '');
+        html += '<div class="' + cls + '" data-r="' + r + '" data-c="' + c + '">' + (isFree ? 'FREE' : val) + '</div>';
+      }
+    }
+    grid.innerHTML = html;
+
+    Array.prototype.forEach.call(grid.querySelectorAll('.bingo-cell'), function(cell){
+      cell.addEventListener('click', function(){
+        if(currentState.status !== 'playing') return;
+        var r = parseInt(cell.getAttribute('data-r'), 10);
+        var c = parseInt(cell.getAttribute('data-c'), 10);
+        toggleMark(r, c);
+      });
+    });
+  }
+
+  function renderWinnerOverlay(state){
+    var overlay = document.getElementById('winnerOverlay');
+    if(state.winner){
+      overlay.classList.remove('hidden');
+      document.getElementById('winnerName').textContent = state.winner.name;
+      document.getElementById('winnerPattern').textContent = 'Patrón: ' + state.winner.pattern;
+      var actions = document.getElementById('winnerActions');
+      if(session.role === 'admin'){
+        actions.innerHTML = '<button class="btn btn-gold" id="btnWinnerNewGame">Nueva partida</button>' +
+                             '<button class="btn btn-outline" id="btnWinnerClose">Cerrar</button>';
+        document.getElementById('btnWinnerNewGame').onclick = function(){ startNewGameAsAdmin(); };
+        document.getElementById('btnWinnerClose').onclick = function(){ overlay.classList.add('hidden'); };
+      } else {
+        actions.innerHTML = '<button class="btn btn-outline" id="btnWinnerClose2">Cerrar</button>';
+        document.getElementById('btnWinnerClose2').onclick = function(){ overlay.classList.add('hidden'); };
+      }
+    } else {
+      overlay.classList.add('hidden');
+    }
+  }
+
+  function startNewGameAsAdmin(){
+    document.getElementById('winnerOverlay').classList.add('hidden');
+    createGameRow().then(function(code){
+      if(!code) return;
+      session = { role:'admin', code: code, playerId:null, playerName:null };
+      return loadFullState(code).then(function(state){
+        currentState = state;
+        subscribeRealtime(code);
+        render();
+      });
+    });
+  }
+
+  /* ---------------- Bulbs decoration ---------------- */
+  (function buildBulbs(){
+    var row = document.getElementById('bulbsRow');
+    var html = '';
+    for(var i=0;i<22;i++){
+      html += '<span class="bulb" style="animation-delay:' + (i*0.07) + 's"></span>';
+    }
+    row.innerHTML = html;
+  })();
+
+  /* ---------------- Event wiring ---------------- */
+
+  document.getElementById('btnCreateGame').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    createGameRow().then(function(code){
+      btn.disabled = false;
+      if(!code) return;
+      session = { role:'admin', code: code, playerId:null, playerName:null };
+      return loadFullState(code).then(function(state){
+        currentState = state;
+        subscribeRealtime(code);
+        render();
+      });
+    });
+  });
+
+  document.getElementById('btnResumeAdmin').addEventListener('click', function(){
+    var code = document.getElementById('adminResumeCode').value.trim().toUpperCase();
+    if(!code){ showToast('Ingresá un código de partida.', 'err'); return; }
+    loadFullState(code).then(function(state){
+      if(!state){ showToast('No existe ninguna partida con ese código.', 'err'); return; }
+      session = { role:'admin', code: code, playerId:null, playerName:null };
+      currentState = state;
+      subscribeRealtime(code);
+      render();
+    });
+  });
+
+  document.getElementById('btnJoinGame').addEventListener('click', function(){
+    var name = document.getElementById('playerName').value.trim();
+    var code = document.getElementById('playerCode').value.trim().toUpperCase();
+    if(!name){ showToast('Ingresá tu nombre.', 'err'); return; }
+    if(!code){ showToast('Ingresá el código de partida.', 'err'); return; }
+    var btn = this;
+    btn.disabled = true;
+    joinPlayerFlow(code, name).then(function(result){
+      btn.disabled = false;
+      if(result.error){ showToast(result.error, 'err'); return; }
+      session = { role:'player', code: code, playerId: result.id, playerName: name };
+      return loadFullState(code).then(function(state){
+        currentState = state;
+        subscribeRealtime(code);
+        render();
+        showToast('¡Cartón asignado! Buena suerte, ' + name + '.', 'ok');
+      });
+    });
+  });
+
+  document.getElementById('btnStartGame').addEventListener('click', function(){ startGame(); });
+  document.getElementById('btnDrawNumber').addEventListener('click', function(){ drawNumber(); });
+  document.getElementById('btnEndGame').addEventListener('click', function(){ endGame(); });
+  document.getElementById('btnNewGameAdmin').addEventListener('click', startNewGameAsAdmin);
+  document.getElementById('btnClaimBingo').addEventListener('click', function(){ claimBingo(); });
+
+  document.getElementById('btnBackLandingAdmin').addEventListener('click', goLanding);
+  document.getElementById('btnBackLandingWait').addEventListener('click', goLanding);
+  document.getElementById('btnBackLandingPlay').addEventListener('click', goLanding);
+
+  /* ---------------- Init ---------------- */
+
+  function init(){
+    if(SUPABASE_URL.indexOf('PON_AQUI') === 0 || SUPABASE_ANON_KEY.indexOf('PON_AQUI') === 0){
+      setConnStatus(false, 'Falta configurar Supabase en el código');
+      showToast('Editá SUPABASE_URL y SUPABASE_ANON_KEY al inicio del script antes de usar el juego.', 'err');
+      showScreen('screen-landing');
+      return;
+    }
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    sb.from('games').select('id').limit(1).then(function(res){
+      if(res.error){
+        setConnStatus(false, 'Error de conexión');
+        showToast('No se pudo conectar a Supabase. Revisá la URL/key y que hayas corrido el script SQL.', 'err');
+      } else {
+        setConnStatus(true, 'Conectado');
+      }
+    });
+    showScreen('screen-landing');
+  }
+
+  init();
+
+})();
